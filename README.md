@@ -8,6 +8,7 @@ Everything runs on your machine: it reads OpenCode's own SQLite database
 and builds a private full-text search index next to it. No network
 calls, no external services, **no data ever leaves your computer**.
 
+[![PyPI](https://img.shields.io/pypi/v/opencode-history-mcp)](https://pypi.org/project/opencode-history-mcp/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-orange)](https://modelcontextprotocol.io)
