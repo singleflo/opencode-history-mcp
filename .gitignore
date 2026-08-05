@@ -1,0 +1,30 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# Build artifacts
+dist/
+build/
+*.whl
+
+# Virtual environments
+venv/
+.venv/
+
+# Local data (generated at runtime, never ship real user data)
+*.db
+*.db-shm
+*.db-wal
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Env
+.env
+.python-version
