@@ -13,6 +13,8 @@ calls, no external services, **no data ever leaves your computer**.
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![MCP](https://img.shields.io/badge/protocol-MCP-orange)](https://modelcontextprotocol.io)
 
+If this saves you from re-diagnosing the same bug twice, consider dropping a ⭐ — it helps other OpenCode users find it too.
+
 ## Why
 
 If you use [OpenCode](https://opencode.ai) daily across many projects,
