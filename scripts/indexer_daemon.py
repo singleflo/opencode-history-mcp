@@ -21,6 +21,58 @@ import time
 DEFAULT_INTERVAL = 300
 
 
+def reap_orphaned_mcp_servers() -> int:
+    """Kill orphaned opencode-history-mcp server processes.
+
+    These accumulate when Hermes/OpenCode die ungracefully (kill -9, crash,
+    force-quit) — the mcp_stdio_watchdog.py wrapper is supposed to handle this
+    but doesn't always fire. We detect orphans by checking if the parent PID
+    is 1 (init/launchd) — a live MCP server should always have a real parent.
+
+    Returns count of processes killed.
+    """
+    import os
+    import signal
+
+    killed = 0
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ps", "-eo", "pid,ppid,comm,args"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.strip().split("\n")[1:]:
+            parts = line.strip().split(None, 3)
+            if len(parts) < 4:
+                continue
+            pid, ppid, comm, args = int(parts[0]), int(parts[1]), parts[2], parts[3]
+
+            # Match our MCP server processes (both entry point and old server.py path)
+            if "opencode-history-mcp" not in args and "opencode_history_mcp" not in args:
+                continue
+
+            # Skip ourselves (the indexer daemon)
+            if "indexer_daemon" in args:
+                continue
+
+            # Skip the watchdog wrapper
+            if "mcp_stdio_watchdog" in args:
+                continue
+
+            # If parent is init (PID 1 = launchd on macOS), it's an orphan
+            if ppid == 1:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    killed += 1
+                    print(f"[history-indexer] Reaped orphan MCP server PID {pid}", file=sys.stderr)
+                except (ProcessLookupError, PermissionError):
+                    pass
+    except Exception as e:
+        print(f"[history-indexer] Orphan reap error (non-fatal): {e}", file=sys.stderr)
+
+    return killed
+
+
 def main() -> None:
     interval = DEFAULT_INTERVAL
     if "--interval" in sys.argv:
@@ -39,6 +91,11 @@ def main() -> None:
 
     while True:
         try:
+            # Reap orphaned MCP server processes
+            reaped = reap_orphaned_mcp_servers()
+            if reaped:
+                print(f"[history-indexer] Reaped {reaped} orphan(s).", file=sys.stderr)
+
             oc = build_index.connect_opencode_db()
             hist = build_index.connect_history_db()
 
