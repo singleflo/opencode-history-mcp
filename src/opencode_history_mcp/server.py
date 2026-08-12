@@ -61,8 +61,45 @@ SKIP_PART_TYPES = {
 # ═══════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════
+# LAZY SYNC (background, non-blocking)
+# ═══════════════════════════════════════════════════════════════
+
+_sync_done = False
+
+
+def _lazy_sync_once() -> None:
+    """Run sync check on first tool call, not on startup.
+
+    Spawns a daemon thread so the server starts instantly and OpenCode/Hermes
+    shutdown is never blocked by a sync in progress.
+    """
+    global _sync_done
+    if _sync_done:
+        return
+    _sync_done = True
+    try:
+        import threading
+        threading.Thread(target=_do_sync, daemon=True).start()
+    except Exception:
+        pass  # Non-fatal — stale index is still usable
+
+
+def _do_sync() -> None:
+    """Background sync wrapper — never raises."""
+    try:
+        check_and_sync()
+    except Exception as e:
+        print(f"[history-mcp] Background sync failed (non-fatal): {e}", file=sys.stderr)
+
+
+# ═══════════════════════════════════════════════════════════════
+# DB CONNECTIONS
+# ═══════════════════════════════════════════════════════════════
+
 def get_history_conn() -> sqlite3.Connection:
     """Get a connection to the history index DB."""
+    _lazy_sync_once()  # Trigger background sync on first real use
     conn = sqlite3.connect(HISTORY_DB)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
@@ -796,8 +833,6 @@ def get_stats(directory: Optional[str] = None) -> dict:
 
 def run() -> None:
     """Entry point used by the `opencode-history-mcp` console script."""
-    if not check_and_sync():
-        print("[history-mcp] Running with a stale or missing index. Some results may be incomplete.", file=sys.stderr)
     mcp.run()
 
 

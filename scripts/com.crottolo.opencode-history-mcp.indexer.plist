@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.crottolo.opencode-history-mcp.indexer</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/crotti/VSC/TOOLS/opencode-history-mcp/venv/bin/python3</string>
+        <string>/Users/crotti/VSC/TOOLS/opencode-history-mcp/scripts/indexer_daemon.py</string>
+        <string>--interval</string>
+        <string>300</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/crotti/VSC/TOOLS/opencode-history-mcp</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/opencode-history-indexer.log</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/opencode-history-indexer.out</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
