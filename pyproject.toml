@@ -29,9 +29,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/crottolo/opencode-history-mcp"
-Repository = "https://github.com/crottolo/opencode-history-mcp"
-Issues = "https://github.com/crottolo/opencode-history-mcp/issues"
+Homepage = "https://github.com/singleflo/opencode-history-mcp"
+Repository = "https://github.com/singleflo/opencode-history-mcp"
+Issues = "https://github.com/singleflo/opencode-history-mcp/issues"
 
 [project.scripts]
 opencode-history-mcp = "opencode_history_mcp.__main__:main"

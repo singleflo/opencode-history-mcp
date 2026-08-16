@@ -247,7 +247,7 @@ making "check first" the default reflex instead of an afterthought.
 ## Development
 
 ```bash
-git clone https://github.com/crottolo/opencode-history-mcp.git
+git clone https://github.com/singleflo/opencode-history-mcp.git
 cd opencode-history-mcp
 uv venv
 uv pip install -e .
