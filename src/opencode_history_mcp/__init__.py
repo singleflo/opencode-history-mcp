@@ -8,4 +8,4 @@ builds a private FTS5 search index. No network calls, no external
 services, no data leaves your machine.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

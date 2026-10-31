@@ -34,7 +34,8 @@ what related work exists in this project?"*
 OpenCode's own DB (read-only)          Our derived index (read-write)
 ┌─────────────────────────┐            ┌──────────────────────────┐
 │ opencode.db              │  builds →  │ opencode-history.db       │
-│ - session / message /part│            │ - sessions (denormalized) │
+│ - session_v2 /          │            │ - sessions (denormalized) │
+│   session_message       │            │                           │
 │ - JSON blobs per row      │            │ - search_idx (FTS5)       │
 └─────────────────────────┘            │ - session_files (index)   │
                                         └──────────────────────────┘
@@ -52,6 +53,17 @@ OpenCode's own DB (read-only)          Our derived index (read-write)
   OpenCode's own DB, on your machine, under your OS user. There is no
   hosted/shared version of this server — everyone runs their own,
   against their own history.
+
+## Compatibility
+
+| OpenCode | opencode-history-mcp |
+|---|---|
+| v1 (tables `session` / `message` / `part`) | `uvx opencode-history-mcp==0.1.0` |
+| v2 (tables `session_v2` / `session_message` / `session_part`) | `>= 0.2.0` |
+
+From 0.2.0 only OpenCode v2 is supported. On a v1 database the indexer and
+the server stop with an error pointing to 0.1.0. OpenCode v2 migrates a v1
+database on first start, after which 0.2.0 works on it.
 
 ## Quickstart
 

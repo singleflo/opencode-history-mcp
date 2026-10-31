@@ -15,7 +15,6 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import math
 import os
 import sqlite3
@@ -27,6 +26,7 @@ from typing import Optional
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from . import build_index
 from .paths import opencode_db_path, history_index_path
 
 # ═══════════════════════════════════════════════════════════════
@@ -35,7 +35,7 @@ from .paths import opencode_db_path, history_index_path
 
 OPENCODE_DB = str(opencode_db_path())
 HISTORY_DB = str(history_index_path())
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Hard caps
 MAX_SNIPPET_CHARS = 200
@@ -51,14 +51,6 @@ W_RECENCY = 0.3
 W_ACTIVITY = 0.2
 RECENCY_HALF_LIFE_DAYS = 180
 
-# Part types to SKIP in get_session_messages
-SKIP_PART_TYPES = {
-    "step-start", "step-finish", "agent", "compaction", "file"
-}
-
-# ═══════════════════════════════════════════════════════════════
-# DB CONNECTIONS
-# ═══════════════════════════════════════════════════════════════
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -66,6 +58,7 @@ SKIP_PART_TYPES = {
 # ═══════════════════════════════════════════════════════════════
 
 _sync_done = False
+_schema_error: Optional[build_index.UnsupportedSchemaError] = None
 
 
 def _lazy_sync_once() -> None:
@@ -86,9 +79,14 @@ def _lazy_sync_once() -> None:
 
 
 def _do_sync() -> None:
-    """Background sync wrapper — never raises."""
+    """Background sync wrapper. A non-v2 OpenCode DB is remembered and
+    raised by the next tool call; other errors are non-fatal."""
+    global _schema_error
     try:
         check_and_sync()
+    except build_index.UnsupportedSchemaError as e:
+        _schema_error = e
+        print(f"[history-mcp] ERROR: {e}", file=sys.stderr)
     except Exception as e:
         print(f"[history-mcp] Background sync failed (non-fatal): {e}", file=sys.stderr)
 
@@ -100,6 +98,8 @@ def _do_sync() -> None:
 def get_history_conn() -> sqlite3.Connection:
     """Get a connection to the history index DB."""
     _lazy_sync_once()  # Trigger background sync on first real use
+    if _schema_error:
+        raise _schema_error
     conn = sqlite3.connect(HISTORY_DB)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
@@ -205,7 +205,7 @@ def check_and_sync() -> bool:
             hist.close()
             return False
 
-        wm = hist.execute("SELECT value FROM index_meta WHERE key='last_sync_part_time'").fetchone()
+        wm = hist.execute("SELECT value FROM index_meta WHERE key='source_watermark'").fetchone()
         if not wm:
             print("[history-mcp] WARNING: No watermark in index. Run --build-index.", file=sys.stderr)
             hist.close()
@@ -215,17 +215,19 @@ def check_and_sync() -> bool:
 
         try:
             oc = get_opencode_conn()
-            db_max = oc.execute("SELECT MAX(time_updated) FROM part").fetchone()[0] or 0
-            oc.close()
-        except Exception:
-            # Can't access OpenCode's DB — not fatal, serve the stale index.
+        except sqlite3.Error:
+            # Can't open OpenCode's DB — not fatal, serve the stale index.
             hist.close()
             return True
+        try:
+            build_index.check_source_schema(oc)  # v1 DB → UnsupportedSchemaError, not swallowed
+            db_max = build_index.source_watermark(oc)
+        finally:
+            oc.close()
 
         if db_max > idx_watermark:
             print(f"[history-mcp] Index stale (delta={db_max - idx_watermark}ms), syncing...", file=sys.stderr)
             try:
-                from . import build_index
                 oc2 = build_index.connect_opencode_db()
                 hist2 = build_index.connect_history_db()
                 build_index.incremental_sync(oc2, hist2)
@@ -237,6 +239,8 @@ def check_and_sync() -> bool:
 
         hist.close()
         return True
+    except build_index.UnsupportedSchemaError:
+        raise
     except Exception as e:
         print(f"[history-mcp] WARNING: Index check failed: {e}", file=sys.stderr)
         return False
@@ -342,7 +346,8 @@ def find_sessions_by_file(
 ) -> dict:
     """Find sessions that modified or mentioned a specific file.
 
-    Searches patch records (files actually changed) and file mentions in text.
+    Matches files changed by edit/write/patch tools ("modified") and files
+    read with the read tool ("mentioned").
     Uses an indexed file_paths table for fast lookup (<50ms).
 
     Args:
@@ -370,7 +375,7 @@ def find_sessions_by_file(
             JOIN sessions s ON sf.session_id = s.session_id
             WHERE sf.file_path LIKE ?
             {dir_filter}
-            ORDER BY sf.time_created DESC
+            ORDER BY sf.how = 'modified' DESC, sf.time_created DESC
             LIMIT 100
         """, params).fetchall()
 
@@ -564,102 +569,53 @@ def get_session_messages(
         offset: Pagination offset (for reading beyond the first page)
 
     Returns:
-        Messages with role, parts (text/tool/patch), and timestamps.
+        User and assistant messages (ordered by seq) with role, parts
+        (text/reasoning/tool/patch) and timestamps.
     """
     limit = min(limit, MAX_MESSAGES)
     conn = get_opencode_conn()
 
+    def clip(text: str) -> str:
+        if len(text) > MAX_PART_CHARS:
+            return text[:MAX_PART_CHARS] + f" [... truncated, {len(text)} chars total]"
+        return text
+
     try:
-        check = conn.execute("SELECT id FROM session WHERE id = ?", (session_id,)).fetchone()
+        build_index.check_source_schema(conn)
+        check = conn.execute("SELECT id FROM session_v2 WHERE id = ?", (session_id,)).fetchone()
         if not check:
             return {"error": f"Session '{session_id}' not found"}
 
-        rows = conn.execute("""
-            SELECT m.id as msg_id, m.time_created as msg_time, m.data as msg_data,
-                   p.id as part_id, p.time_created as part_time, p.data as part_data
-            FROM (
-                SELECT id, time_created, data, session_id
-                FROM message
-                WHERE session_id = ?
-                ORDER BY time_created ASC
-                LIMIT ? OFFSET ?
-            ) m
-            LEFT JOIN part p ON p.message_id = m.id
-            ORDER BY m.time_created ASC, p.time_created ASC
-        """, (session_id, limit, offset)).fetchall()
+        all_msgs = [m for m in build_index.load_messages(conn, session_id)
+                    if m["type"] in ("user", "assistant")]
 
         messages = []
-        current_msg = None
-        msg_count = 0
-
-        for row in rows:
-            msg_id = row["msg_id"]
-            if msg_id is None:
-                continue
-
-            if current_msg is None or msg_id != current_msg["msg_id"]:
-                if current_msg and len(current_msg["parts"]) > 0:
-                    messages.append(current_msg)
-                    msg_count += 1
-                    if msg_count >= limit:
-                        break
-
-                try:
-                    msg_data = json.loads(row["msg_data"]) if row["msg_data"] else {}
-                except json.JSONDecodeError:
-                    msg_data = {}
-
-                current_msg = {
-                    "msg_id": msg_id,
-                    "role": msg_data.get("role", "unknown"),
-                    "time": datetime.fromtimestamp(row["msg_time"] / 1000, tz=timezone.utc).isoformat(),
-                    "parts": [],
-                }
-
-            try:
-                pd = json.loads(row["part_data"]) if row["part_data"] else None
-            except json.JSONDecodeError:
-                pd = None
-
-            if not pd:
-                continue
-
-            ptype = pd.get("type", "")
-
-            if ptype == "text":
-                text = pd.get("text", "")
-                if len(text) > MAX_PART_CHARS:
-                    text = text[:MAX_PART_CHARS] + f" [... truncated, {len(text)} chars total]"
-                current_msg["parts"].append({"type": "text", "text": text})
-
-            elif ptype == "tool":
-                state = pd.get("state", {})
-                current_msg["parts"].append({
-                    "type": "tool",
-                    "name": pd.get("tool", "unknown"),
-                    "status": state.get("status", "unknown"),
-                })
-
-            elif ptype == "patch":
-                files = pd.get("files", [])
+        for m in all_msgs[offset:offset + limit]:
+            parts = []
+            if m["type"] == "user":
+                if m["data"].get("text"):
+                    parts.append({"type": "text", "text": clip(m["data"]["text"])})
+            else:
+                for item in m["content"]:
+                    kind = item.get("type")
+                    if kind in ("text", "reasoning") and item.get("text"):
+                        parts.append({"type": kind, "text": clip(item["text"])})
+                    elif kind == "tool":
+                        parts.append({
+                            "type": "tool",
+                            "name": item.get("name", "unknown"),
+                            "status": (item.get("state") or {}).get("status", "unknown"),
+                        })
+                files = (m["data"].get("snapshot") or {}).get("files") or []
                 if files:
-                    current_msg["parts"].append({"type": "patch", "files": files[:10]})
+                    parts.append({"type": "patch", "files": files[:10]})
+            messages.append({
+                "role": m["type"],
+                "time": datetime.fromtimestamp(m["time_created"] / 1000, tz=timezone.utc).isoformat(),
+                "parts": parts,
+            })
 
-            elif ptype == "reasoning":
-                text = pd.get("text", "")
-                if text:
-                    if len(text) > MAX_PART_CHARS:
-                        text = text[:MAX_PART_CHARS] + f" [... truncated, {len(text)} chars total]"
-                    current_msg["parts"].append({"type": "reasoning", "text": text})
-
-            # step-start, step-finish, agent, file, compaction → SKIP
-
-        if current_msg and len(current_msg["parts"]) > 0:
-            current_msg.pop("msg_id", None)
-            messages.append(current_msg)
-
-        total = conn.execute("SELECT COUNT(*) FROM message WHERE session_id = ?", (session_id,)).fetchone()[0]
-
+        total = len(all_msgs)
         return {
             "session_id": session_id,
             "messages": messages,
