@@ -24,11 +24,15 @@ zero runtime dependencies beyond FastMCP itself.
 
 ## 2. Why a separate index
 
-OpenCode's own database stores conversation content as JSON blobs
-inside `message.data` and `part.data` columns. Searching that directly
-means scanning and `json_extract()`-ing every row on every query —
-fine for a handful of sessions, painfully slow once you have thousands
-(a real-world OpenCode history can reach 10+ GB and 500k+ `part` rows).
+OpenCode v2 stores conversation content as JSON in `session_message.data`
+(assistant text, reasoning and tool calls inline in `data.content`;
+`session_part` rows, when present, replace that inline list). Searching
+that directly means scanning and `json_extract()`-ing every row on every
+query — fine for a handful of sessions, painfully slow once you have
+thousands.
+
+Only OpenCode v2 is supported (`session_v2` must exist). A v1 database
+(`session` without `session_v2`) stops with an error pointing to 0.1.0.
 
 So we build a **separate, derived index**:
 
@@ -58,7 +62,7 @@ CREATE TABLE sessions (
     time_updated         INTEGER NOT NULL,
     msg_count            INTEGER NOT NULL DEFAULT 0,
     tool_count           INTEGER NOT NULL DEFAULT 0,
-    patch_count          INTEGER NOT NULL DEFAULT 0,
+    patch_count          INTEGER NOT NULL DEFAULT 0,   -- edit/write/patch tool calls
     text_count           INTEGER NOT NULL DEFAULT 0,
     reasoning_count      INTEGER NOT NULL DEFAULT 0,
     cost                 REAL NOT NULL DEFAULT 0,
@@ -69,15 +73,16 @@ CREATE TABLE sessions (
     tokens_cache_write    INTEGER NOT NULL DEFAULT 0,
     first_user_prompt     TEXT,   -- the session's original task, truncated to 500 chars
     last_assistant_text    TEXT,   -- stand-in for a "summary" (OpenCode has no compaction summary field)
-    schema_version         INTEGER NOT NULL DEFAULT 1
+    schema_version         INTEGER NOT NULL DEFAULT 1   -- rows are written with 2
 );
 ```
 
 Sub-agent sessions (spawned by a root session, e.g. explore/librarian
 agents) are resolved to their `root_session_id` via a recursive CTE
-over `parent_id` at build time — this lets search results group by
+over `session_v2.parent_id` at build time — this lets search results group by
 "real" conversation instead of surfacing every sub-agent run as a
-separate hit.
+separate hit. Forks (`fork_session_id`) have no `parent_id` and are
+indexed as independent roots.
 
 ### 3.2 `search_idx` — FTS5, text parts only
 
@@ -93,9 +98,9 @@ CREATE VIRTUAL TABLE search_idx USING fts5(
 );
 ```
 
-Only `part.type = 'text'` rows go in — no tool output, no reasoning
-traces, no patch diffs. This keeps the index small and the search
-signal clean.
+Only user message text and assistant `text` items go in — no tool
+output, no reasoning, no system/idle messages. This keeps the index
+small and the search signal clean.
 
 ### 3.3 `session_files` — file → session lookup
 
@@ -104,21 +109,22 @@ CREATE TABLE session_files (
     session_id      TEXT NOT NULL,
     root_session_id TEXT NOT NULL,
     file_path       TEXT NOT NULL,
-    how             TEXT NOT NULL,   -- 'modified' (from a patch part)
+    how             TEXT NOT NULL,   -- 'modified' | 'mentioned'
     time_created    INTEGER NOT NULL,
     PRIMARY KEY (session_id, file_path, how)
 );
 ```
 
-Populated from `patch`-type parts' `files` array at build time —
-answers "which sessions touched this file?" in under 50ms via the
-indexed `file_path` column, instead of a `LIKE` scan over every text
-part.
+Populated from assistant tool calls: `edit`/`write`/`patch` → `modified`,
+`read` → `mentioned`. Paths come from `state.input.path` and
+`state.metadata.files[].file`, resolved against the session directory;
+`snapshot.files` adds `modified` entries. Answers "which sessions
+touched this file?" in under 50ms via the indexed `file_path` column.
 
 ### 3.4 `index_meta` — sync bookkeeping
 
-Key/value table tracking `schema_version`, the sync watermark
-(`last_sync_part_time`), and rebuild timestamps — see §4.
+Key/value table tracking `schema_version` (2), the sync watermark
+(`source_watermark`), and rebuild timestamps — see §4.
 
 ## 4. Sync strategy
 
@@ -128,9 +134,8 @@ Key/value table tracking `schema_version`, the sync watermark
 opencode-history-mcp --build-index
 ```
 
-Drops and recreates the schema, then does a single-pass extraction:
-resolve all roots → index sessions → index text parts (batched
-inserts, 5000 rows/batch) → index patch files → write the watermark.
+Drops and recreates the schema, then indexes every session in
+`session_v2` (metadata, FTS text, files) and writes the watermark.
 
 ### Incremental sync (on server startup)
 
@@ -138,15 +143,18 @@ The server checks the index on startup (TTL-cached, 5 minutes between
 checks to avoid overhead on every tool call):
 
 ```
-db_max = MAX(part.time_updated) in OpenCode's DB
-idx_max = index_meta['last_sync_part_time']
+db_max = MAX(time_updated) over session_v2, session_message, session_part
+idx_max = index_meta['source_watermark']
 
 if db_max > idx_max:
-    affected_sessions = sessions with part.time_updated > idx_max
+    affected_sessions = sessions with a row in any of the 3 tables
+                        updated after idx_max
     for each affected session: delete its old index rows, re-index it
     detect and remove sessions that no longer exist in OpenCode's DB
     update the watermark
 ```
+
+A v1 OpenCode DB makes the check raise instead of serving a stale index.
 
 We use `time_updated` (not `time_created`) because OpenCode sessions
 are long-lived — a session opened weeks ago can still receive new
@@ -166,7 +174,7 @@ version, a full rebuild runs automatically instead of erroring.
 | `find_sessions_by_file` | `LIKE` on indexed `session_files.file_path` | <50ms |
 | `list_sessions` | Sorted scan of `sessions`, pre-aggregated columns | <5ms |
 | `get_session_detail` | Single-row lookup + `session_files` join | <5ms |
-| `get_session_messages` | Paginated join against OpenCode's own DB (`message`/`part`) — the only tool that reads the source DB directly, since full message content isn't duplicated into the index | ~10-30ms |
+| `get_session_messages` | Reads `session_message` (+ `session_part`) from OpenCode's own DB, ordered by `seq`, paginated over user/assistant messages — the only tool that reads the source DB directly, since full message content isn't duplicated into the index | ~10-30ms |
 | `get_stats` | Aggregate `COUNT`/`SUM`/`FILTER` over `sessions` | <10ms |
 
 `get_session_messages` deliberately reads from OpenCode's DB rather

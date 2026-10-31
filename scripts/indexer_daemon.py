@@ -101,14 +101,15 @@ def main() -> None:
 
             # Check if sync needed
             wm_row = hist.execute(
-                "SELECT value FROM index_meta WHERE key='last_sync_part_time'"
+                "SELECT value FROM index_meta WHERE key='source_watermark'"
             ).fetchone()
 
             if not wm_row:
                 print("[history-indexer] No watermark, skipping (run --build-index first)", file=sys.stderr)
             else:
                 idx_watermark = int(wm_row["value"])
-                db_max = oc.execute("SELECT MAX(time_updated) FROM part").fetchone()[0] or 0
+                build_index.check_source_schema(oc)
+                db_max = build_index.source_watermark(oc)
 
                 if db_max > idx_watermark:
                     delta = db_max - idx_watermark

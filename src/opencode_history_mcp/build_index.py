@@ -1,6 +1,6 @@
 """build_index.py — Indexer for the OpenCode History MCP server.
 
-Reads OpenCode's SQLite database (read-only) and builds a separate FTS5
+Reads OpenCode v2's SQLite database (read-only) and builds a separate FTS5
 search index with denormalized metadata for fast queries. This keeps the
 source database untouched and lets us do full-text search without paying
 the cost of scanning JSON blobs on every query.
@@ -22,7 +22,7 @@ from .paths import opencode_db_path, history_index_path
 
 OPENCODE_DB = str(opencode_db_path())
 HISTORY_DB = str(history_index_path())
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ═══════════════════════════════════════════════════════════════
 # DB CONNECTION HELPERS
@@ -45,6 +45,108 @@ def connect_history_db(path: str = HISTORY_DB) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+# ═══════════════════════════════════════════════════════════════
+# SOURCE (OpenCode v2) READERS
+# ═══════════════════════════════════════════════════════════════
+
+# Tools whose `path` input is a file they modify / only read.
+MODIFY_TOOLS = {"write", "edit", "patch"}
+READ_TOOLS = {"read"}
+
+
+class UnsupportedSchemaError(RuntimeError):
+    """The OpenCode DB is not an OpenCode v2 database."""
+
+
+def check_source_schema(oc_conn: sqlite3.Connection) -> None:
+    """Fail clearly unless the DB has the OpenCode v2 tables."""
+    tables = {r[0] for r in oc_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "session_v2" in tables:
+        return
+    if "session" in tables:
+        raise UnsupportedSchemaError(
+            "This is an OpenCode v1 database (table `session`, no `session_v2`). "
+            "opencode-history-mcp >= 0.2.0 only supports OpenCode v2; "
+            "for v1 use `uvx opencode-history-mcp==0.1.0`."
+        )
+    raise UnsupportedSchemaError("No OpenCode session tables found (expected `session_v2`).")
+
+
+def source_watermark(oc_conn: sqlite3.Connection) -> int:
+    """Latest time_updated across sessions, messages and parts (epoch ms)."""
+    return oc_conn.execute("""
+        SELECT MAX(t) FROM (
+            SELECT MAX(time_updated) AS t FROM session_v2
+            UNION ALL SELECT MAX(time_updated) FROM session_message
+            UNION ALL SELECT MAX(time_updated) FROM session_part
+        )
+    """).fetchone()[0] or 0
+
+
+def load_messages(oc_conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    """Return a session's messages ordered by seq.
+
+    Each item: {id, type, time_created, data, content}. `content` is the
+    assistant item list, taken from `session_part` when it has rows for the
+    message, otherwise from the inline `data.content`.
+    """
+    parts: dict[str, list[dict]] = {}
+    for row in oc_conn.execute(
+        "SELECT message_id, data FROM session_part WHERE session_id = ? ORDER BY message_id, ordinal",
+        (session_id,),
+    ):
+        try:
+            parts.setdefault(row["message_id"], []).append(json.loads(row["data"]))
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    messages = []
+    for row in oc_conn.execute(
+        "SELECT id, type, time_created, data FROM session_message WHERE session_id = ? ORDER BY seq",
+        (session_id,),
+    ):
+        try:
+            data = json.loads(row["data"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        content = parts.get(row["id"]) or data.get("content") or []
+        messages.append({
+            "id": row["id"],
+            "type": row["type"],
+            "time_created": row["time_created"],
+            "data": data,
+            "content": content,
+        })
+    return messages
+
+
+def _resolve_path(path: str, directory: str) -> str:
+    path = path.strip()
+    if directory and not os.path.isabs(path):
+        path = os.path.join(directory, path)
+    return os.path.normpath(path)
+
+
+def tool_files(item: dict, directory: str) -> list[tuple[str, str]]:
+    """(file_path, how) pairs touched by one assistant tool item."""
+    name = item.get("name")
+    if name in MODIFY_TOOLS:
+        how = "modified"
+    elif name in READ_TOOLS:
+        how = "mentioned"
+    else:
+        return []
+    state = item.get("state") or {}
+    paths = []
+    path = (state.get("input") or {}).get("path")
+    if isinstance(path, str) and path.strip():
+        paths.append(path)
+    for f in (state.get("metadata") or {}).get("files") or []:
+        if isinstance(f, dict) and isinstance(f.get("file"), str) and f["file"].strip():
+            paths.append(f["file"])
+    return [(_resolve_path(p, directory), how) for p in paths]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -122,15 +224,14 @@ def create_schema(conn: sqlite3.Connection) -> None:
 def resolve_all_roots(oc_conn: sqlite3.Connection) -> dict[str, str]:
     """Resolve root_session_id for ALL sessions using a recursive CTE.
 
-    Sub-agent sessions form a tree rooted at the top-level user session;
-    this walks that tree so every session (root or sub-agent) can be
-    grouped by its ultimate ancestor.
+    Sub-agent sessions form a tree (via parent_id) rooted at the top-level
+    user session. Forks have no parent_id, so they are independent roots.
     """
     rows = oc_conn.execute("""
         WITH RECURSIVE root_finder(id, root) AS (
-            SELECT id, id FROM session WHERE parent_id IS NULL
+            SELECT id, id FROM session_v2 WHERE parent_id IS NULL
             UNION ALL
-            SELECT s.id, rf.root FROM session s
+            SELECT s.id, rf.root FROM session_v2 s
             JOIN root_finder rf ON s.parent_id = rf.id
         )
         SELECT id, root FROM root_finder
@@ -146,6 +247,7 @@ def resolve_all_roots(oc_conn: sqlite3.Connection) -> dict[str, str]:
 def full_build(oc_conn: sqlite3.Connection, hist_conn: sqlite3.Connection) -> None:
     """Full rebuild of the index from scratch."""
     t0 = time.time()
+    check_source_schema(oc_conn)
     print("[build] Starting full index rebuild...")
 
     hist_conn.executescript("""
@@ -156,219 +258,22 @@ def full_build(oc_conn: sqlite3.Connection, hist_conn: sqlite3.Connection) -> No
     """)
     create_schema(hist_conn)
 
-    # 1. Resolve all root sessions
-    print("[build] Resolving root sessions...")
+    watermark = source_watermark(oc_conn)
     root_map = resolve_all_roots(oc_conn)
-    print(f"[build]   {len(root_map)} sessions resolved to roots")
+    session_ids = [r["id"] for r in oc_conn.execute("SELECT id FROM session_v2")]
+    for sid in session_ids:
+        _index_single_session(oc_conn, hist_conn, sid, root_map)
 
-    # 2. Index sessions with pre-aggregated stats
-    print("[build] Indexing sessions...")
-    sessions = oc_conn.execute("""
-        SELECT s.id, s.parent_id, s.title, s.directory, s.project_id,
-               s.time_created, s.time_updated,
-               s.cost, s.tokens_input, s.tokens_output, s.tokens_reasoning,
-               s.tokens_cache_read, s.tokens_cache_write
-        FROM session s
-    """).fetchall()
-
-    print("[build] Computing part counts per session...")
-    part_counts: dict[str, dict] = {}
-    for row in oc_conn.execute("""
-        SELECT session_id,
-               SUM(CASE WHEN json_extract(data, '$.type') = 'tool' THEN 1 ELSE 0 END) as tool_count,
-               SUM(CASE WHEN json_extract(data, '$.type') = 'patch' THEN 1 ELSE 0 END) as patch_count,
-               SUM(CASE WHEN json_extract(data, '$.type') = 'text' THEN 1 ELSE 0 END) as text_count,
-               SUM(CASE WHEN json_extract(data, '$.type') = 'reasoning' THEN 1 ELSE 0 END) as reasoning_count,
-               COUNT(*) as total
-        FROM part GROUP BY session_id
-    """).fetchall():
-        part_counts[row["session_id"]] = dict(row)
-
-    msg_counts: dict[str, int] = {}
-    for row in oc_conn.execute("""
-        SELECT session_id, COUNT(*) as cnt FROM message GROUP BY session_id
-    """).fetchall():
-        msg_counts[row["session_id"]] = row["cnt"]
-
-    session_rows = []
-    for s in sessions:
-        sid = s["id"]
-        root = root_map.get(sid, sid)
-        pc = part_counts.get(sid, {})
-        mc = msg_counts.get(sid, 0)
-
-        session_rows.append((
-            sid,
-            root,
-            1 if s["parent_id"] else 0,
-            s["parent_id"],
-            s["title"] or "",
-            s["directory"] or "",
-            s["project_id"],
-            s["time_created"],
-            s["time_updated"],
-            mc,
-            pc.get("tool_count", 0) or 0,
-            pc.get("patch_count", 0) or 0,
-            pc.get("text_count", 0) or 0,
-            pc.get("reasoning_count", 0) or 0,
-            s["cost"] or 0,
-            s["tokens_input"] or 0,
-            s["tokens_output"] or 0,
-            s["tokens_reasoning"] or 0,
-            s["tokens_cache_read"] or 0,
-            s["tokens_cache_write"] or 0,
-            None,  # first_user_prompt — filled later
-            None,  # last_assistant_text — filled later
-            SCHEMA_VERSION,
-        ))
-
-    hist_conn.executemany("""
-        INSERT INTO sessions (
-            session_id, root_session_id, is_sub_agent, parent_id, title, directory,
-            project_id, time_created, time_updated,
-            msg_count, tool_count, patch_count, text_count, reasoning_count,
-            cost, tokens_input, tokens_output, tokens_reasoning,
-            tokens_cache_read, tokens_cache_write,
-            first_user_prompt, last_assistant_text, schema_version
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, session_rows)
-    print(f"[build]   {len(session_rows)} sessions indexed")
-
-    # 3. Index text parts into FTS5
-    print("[build] Indexing text parts (FTS5)...")
-    fts_rows = []
-    first_prompts: dict[str, tuple[int, str]] = {}
-    last_assistant: dict[str, tuple[int, str]] = {}
-
-    batch_size = 5000
-    total_text = 0
-
-    cursor = oc_conn.execute("""
-        SELECT p.id, p.session_id, p.time_created, p.data,
-               m.data as msg_data
-        FROM part p
-        JOIN message m ON p.message_id = m.id
-        WHERE json_extract(p.data, '$.type') = 'text'
-        ORDER BY p.time_created
-    """)
-
-    while True:
-        batch = cursor.fetchmany(batch_size)
-        if not batch:
-            break
-        for row in batch:
-            try:
-                part_data = json.loads(row["data"])
-                msg_data = json.loads(row["msg_data"])
-            except (json.JSONDecodeError, TypeError):
-                continue
-
-            text = part_data.get("text", "")
-            role = msg_data.get("role", "unknown")
-            sid = row["session_id"]
-            root = root_map.get(sid, sid)
-
-            if not text or not text.strip():
-                continue
-
-            # Truncate very long text for FTS (keep first 5000 chars)
-            fts_text = text[:5000] if len(text) > 5000 else text
-
-            fts_rows.append((
-                sid,
-                root,
-                "",  # directory is joined from `sessions` at query time
-                role,
-                fts_text,
-                row["time_created"],
-            ))
-            total_text += 1
-
-            if role == "user":
-                tc = row["time_created"]
-                if sid not in first_prompts or tc < first_prompts[sid][0]:
-                    first_prompts[sid] = (tc, text[:500])
-
-            if role == "assistant":
-                tc = row["time_created"]
-                if sid not in last_assistant or tc > last_assistant[sid][0]:
-                    last_assistant[sid] = (tc, text[:500])
-
-        if len(fts_rows) >= batch_size:
-            hist_conn.executemany("""
-                INSERT INTO search_idx (session_id, root_session_id, directory, role, text, time_created)
-                VALUES (?,?,?,?,?,?)
-            """, fts_rows)
-            fts_rows = []
-
-    if fts_rows:
-        hist_conn.executemany("""
-            INSERT INTO search_idx (session_id, root_session_id, directory, role, text, time_created)
-            VALUES (?,?,?,?,?,?)
-        """, fts_rows)
-
-    print(f"[build]   {total_text} text parts indexed in FTS5")
-
-    # 4. Update first_user_prompt and last_assistant_text
-    print("[build] Updating first prompts and last assistant texts...")
-    for sid, (_tc, text) in first_prompts.items():
-        hist_conn.execute(
-            "UPDATE sessions SET first_user_prompt = ? WHERE session_id = ?",
-            (text, sid)
-        )
-    for sid, (_tc, text) in last_assistant.items():
-        hist_conn.execute(
-            "UPDATE sessions SET last_assistant_text = ? WHERE session_id = ?",
-            (text, sid)
-        )
-    print(f"[build]   {len(first_prompts)} first prompts, {len(last_assistant)} last assistant texts")
-
-    # 5. Index patch files into session_files
-    print("[build] Indexing patch files...")
-    file_rows = []
-    for row in oc_conn.execute("""
-        SELECT p.session_id, p.time_created, p.data
-        FROM part p
-        WHERE json_extract(p.data, '$.type') = 'patch'
-          AND json_extract(p.data, '$.files') IS NOT NULL
-    """).fetchall():
-        try:
-            data = json.loads(row["data"])
-            files = data.get("files", [])
-            if not isinstance(files, list):
-                continue
-            sid = row["session_id"]
-            root = root_map.get(sid, sid)
-            for f in files:
-                if isinstance(f, str) and f.strip():
-                    file_rows.append((sid, root, f.strip(), "modified", row["time_created"]))
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-    if file_rows:
-        hist_conn.executemany("""
-            INSERT OR IGNORE INTO session_files (session_id, root_session_id, file_path, how, time_created)
-            VALUES (?,?,?,?,?)
-        """, file_rows)
-    print(f"[build]   {len(file_rows)} file references indexed")
-
-    # 6. Update index_meta (watermarks used by incremental sync)
-    max_part_updated = oc_conn.execute("SELECT MAX(time_updated) FROM part").fetchone()[0] or 0
-    max_session_updated = oc_conn.execute("SELECT MAX(time_updated) FROM session").fetchone()[0] or 0
-
-    hist_conn.executescript(f"""
-        INSERT OR REPLACE INTO index_meta (key, value) VALUES
-        ('schema_version', '{SCHEMA_VERSION}'),
-        ('last_sync_part_time', '{max_part_updated}'),
-        ('last_sync_session_time', '{max_session_updated}'),
-        ('last_rebuild', '{int(time.time() * 1000)}'),
-        ('opencode_db_path', '{OPENCODE_DB}');
-    """)
+    hist_conn.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?, ?), (?, ?), (?, ?)",
+        ("schema_version", str(SCHEMA_VERSION), "last_rebuild", str(int(time.time() * 1000)),
+         "opencode_db_path", OPENCODE_DB),
+    )
+    _update_watermark(hist_conn, watermark)
 
     hist_conn.commit()
     elapsed = time.time() - t0
-    db_size = os.path.getsize(HISTORY_DB) / (1024 * 1024)
+    db_size = os.path.getsize(HISTORY_DB) / (1024 * 1024) if os.path.exists(HISTORY_DB) else 0
     print(f"[build] Done in {elapsed:.1f}s. DB size: {db_size:.1f} MB")
 
     total_sessions = hist_conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
@@ -384,18 +289,17 @@ def full_build(oc_conn: sqlite3.Connection, hist_conn: sqlite3.Connection) -> No
 
 
 def incremental_sync(oc_conn: sqlite3.Connection, hist_conn: sqlite3.Connection) -> None:
-    """True incremental sync: only re-index sessions with new/updated parts.
+    """Re-index only sessions changed since the watermark.
 
     Algorithm:
-        1. Compare watermarks (time_updated on the `part` table).
-        2. Find affected session_ids (parts updated since the watermark).
-        3. For each affected session: delete its old index rows, re-index
-           only that session.
-        4. Detect deleted sessions (present in the index but gone from
-           OpenCode's DB) and remove them.
-        5. Update the watermark.
+        1. Compare the index watermark with MAX(time_updated) over
+           session_v2, session_message and session_part.
+        2. Re-index every session with a row updated after the watermark.
+        3. Remove sessions deleted from OpenCode's DB.
+        4. Update the watermark.
     """
     t0 = time.time()
+    check_source_schema(oc_conn)
 
     tables = hist_conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='index_meta'"
@@ -414,7 +318,7 @@ def incremental_sync(oc_conn: sqlite3.Connection, hist_conn: sqlite3.Connection)
         return
 
     wm_row = hist_conn.execute(
-        "SELECT value FROM index_meta WHERE key='last_sync_part_time'"
+        "SELECT value FROM index_meta WHERE key='source_watermark'"
     ).fetchone()
     if not wm_row:
         print("[sync] No watermark found, running full build...")
@@ -422,107 +326,100 @@ def incremental_sync(oc_conn: sqlite3.Connection, hist_conn: sqlite3.Connection)
         return
 
     watermark = int(wm_row["value"])
-    db_max_part = oc_conn.execute("SELECT MAX(time_updated) FROM part").fetchone()[0] or 0
-    db_max_sess = oc_conn.execute("SELECT MAX(time_updated) FROM session").fetchone()[0] or 0
+    db_max = source_watermark(oc_conn)
 
-    if db_max_part <= watermark:
+    if db_max <= watermark:
         deleted = _detect_deleted_sessions(oc_conn, hist_conn)
         if deleted:
-            print(f"[sync] Removed {deleted} deleted sessions from index...")
+            print(f"[sync] Removed {deleted} deleted sessions from index")
+            hist_conn.commit()
         else:
             print(f"[sync] Index is up to date (watermark={watermark})")
-        _update_watermark(hist_conn, db_max_part, db_max_sess)
         return
 
-    print(f"[sync] Syncing changes since watermark={watermark} (db_max={db_max_part})...")
+    print(f"[sync] Syncing changes since watermark={watermark} (db_max={db_max})...")
 
-    # 1. Find affected sessions (parts updated since watermark)
-    affected_rows = oc_conn.execute("""
-        SELECT DISTINCT session_id FROM part WHERE time_updated > ?
-    """, (watermark,)).fetchall()
-    affected_ids = [r["session_id"] for r in affected_rows]
+    affected = [r[0] for r in oc_conn.execute("""
+        SELECT id FROM session_v2 WHERE time_updated > ?1
+        UNION SELECT session_id FROM session_message WHERE time_updated > ?1
+        UNION SELECT session_id FROM session_part WHERE time_updated > ?1
+    """, (watermark,))]
 
-    # Also check for new sessions not yet reflected in `part`
-    sess_wm_row = hist_conn.execute(
-        "SELECT value FROM index_meta WHERE key='last_sync_session_time'"
-    ).fetchone()
-    sess_watermark = int(sess_wm_row["value"]) if sess_wm_row else 0
-
-    new_sessions = oc_conn.execute("""
-        SELECT DISTINCT id FROM session WHERE time_updated > ?
-    """, (sess_watermark,)).fetchall()
-    new_sess_ids = [r["id"] for r in new_sessions if r["id"] not in affected_ids]
-
-    all_affected = list(set(affected_ids + new_sess_ids))
-
-    if not all_affected:
-        _update_watermark(hist_conn, db_max_part, db_max_sess)
-        print("[sync] No affected sessions found, watermark updated.")
-        return
-
-    print(f"[sync] {len(all_affected)} sessions to update ({len(affected_ids)} from parts, {len(new_sess_ids)} new)")
-
-    # 2. Resolve roots for ALL sessions (needed for sub-agent mapping)
     root_map = resolve_all_roots(oc_conn)
+    _remove_sessions_from_index(hist_conn, affected)
 
-    # 3. Delete old index data for affected sessions
-    _remove_sessions_from_index(hist_conn, all_affected)
-
-    # 4. Re-index each affected session
-    indexed_sessions = 0
-    indexed_parts = 0
-    indexed_files = 0
-
-    for sid in all_affected:
+    indexed_sessions = indexed_texts = indexed_files = 0
+    for sid in affected:
         s, p, f = _index_single_session(oc_conn, hist_conn, sid, root_map)
         indexed_sessions += s
-        indexed_parts += p
+        indexed_texts += p
         indexed_files += f
 
-    # 5. Detect and remove deleted sessions
     deleted = _detect_deleted_sessions(oc_conn, hist_conn)
     if deleted:
         print(f"[sync] Removed {deleted} deleted sessions from index")
 
-    # 6. Update watermark
-    _update_watermark(hist_conn, db_max_part, db_max_sess)
+    _update_watermark(hist_conn, db_max)
 
     hist_conn.commit()
     elapsed = time.time() - t0
-    print(f"[sync] Done in {elapsed:.1f}s. Sessions: {indexed_sessions}, Parts: {indexed_parts}, Files: {indexed_files}")
+    print(f"[sync] Done in {elapsed:.1f}s. Sessions: {indexed_sessions}, Texts: {indexed_texts}, Files: {indexed_files}")
 
 
 def _index_single_session(oc_conn, hist_conn, session_id, root_map):
-    """Re-index a single session: insert into sessions, search_idx, session_files.
+    """Index one session into sessions, search_idx and session_files.
 
-    Returns (sessions_counted, parts_counted, files_counted).
+    Returns (sessions_counted, texts_counted, files_counted).
     """
     s = oc_conn.execute("""
         SELECT id, parent_id, title, directory, project_id,
                time_created, time_updated,
                cost, tokens_input, tokens_output, tokens_reasoning,
                tokens_cache_read, tokens_cache_write
-        FROM session WHERE id = ?
+        FROM session_v2 WHERE id = ?
     """, (session_id,)).fetchone()
 
     if not s:
         return 0, 0, 0
 
     root = root_map.get(session_id, session_id)
+    directory = s["directory"] or ""
 
-    pc = oc_conn.execute("""
-        SELECT
-            SUM(CASE WHEN json_extract(data, '$.type') = 'tool' THEN 1 ELSE 0 END) as tool_count,
-            SUM(CASE WHEN json_extract(data, '$.type') = 'patch' THEN 1 ELSE 0 END) as patch_count,
-            SUM(CASE WHEN json_extract(data, '$.type') = 'text' THEN 1 ELSE 0 END) as text_count,
-            SUM(CASE WHEN json_extract(data, '$.type') = 'reasoning' THEN 1 ELSE 0 END) as reasoning_count,
-            COUNT(*) as total
-        FROM part WHERE session_id = ?
-    """, (session_id,)).fetchone()
+    msg_count = tool_count = patch_count = text_count = reasoning_count = 0
+    texts: list[tuple[str, str, int]] = []  # (role, text, time_created)
+    files: dict[tuple[str, str], int] = {}  # (path, how) -> time_created
 
-    msg_count = oc_conn.execute(
-        "SELECT COUNT(*) FROM message WHERE session_id = ?", (session_id,)
-    ).fetchone()[0]
+    for m in load_messages(oc_conn, session_id):
+        tc = m["time_created"]
+        if m["type"] == "user":
+            msg_count += 1
+            text = m["data"].get("text") or ""
+            if text.strip():
+                texts.append(("user", text, tc))
+                text_count += 1
+        elif m["type"] == "assistant":
+            msg_count += 1
+            for item in m["content"]:
+                kind = item.get("type")
+                if kind == "text":
+                    text = item.get("text") or ""
+                    if text.strip():
+                        texts.append(("assistant", text, tc))
+                        text_count += 1
+                elif kind == "reasoning":
+                    reasoning_count += 1
+                elif kind == "tool":
+                    tool_count += 1
+                    if item.get("name") in MODIFY_TOOLS:
+                        patch_count += 1
+                    for key in tool_files(item, directory):
+                        files.setdefault(key, tc)
+            for f in (m["data"].get("snapshot") or {}).get("files") or []:
+                if isinstance(f, str) and f.strip():
+                    files.setdefault((_resolve_path(f, directory), "modified"), tc)
+
+    first_prompt = next((t[:500] for role, t, _ in texts if role == "user"), None)
+    last_assistant = next((t[:500] for role, t, _ in reversed(texts) if role == "assistant"), None)
 
     hist_conn.execute("""
         INSERT OR REPLACE INTO sessions (
@@ -535,98 +432,32 @@ def _index_single_session(oc_conn, hist_conn, session_id, root_map):
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         session_id, root, 1 if s["parent_id"] else 0, s["parent_id"],
-        s["title"] or "", s["directory"] or "", s["project_id"],
+        s["title"] or "", directory, s["project_id"],
         s["time_created"], s["time_updated"],
-        msg_count,
-        pc["tool_count"] or 0, pc["patch_count"] or 0,
-        pc["text_count"] or 0, pc["reasoning_count"] or 0,
+        msg_count, tool_count, patch_count, text_count, reasoning_count,
         s["cost"] or 0, s["tokens_input"] or 0, s["tokens_output"] or 0,
         s["tokens_reasoning"] or 0, s["tokens_cache_read"] or 0, s["tokens_cache_write"] or 0,
-        None, None, SCHEMA_VERSION,
+        first_prompt, last_assistant, SCHEMA_VERSION,
     ))
 
-    parts_counted = 0
-    first_prompt = None
-    last_assistant = None
+    # directory is joined from `sessions` at query time; FTS text capped at 5000 chars
+    hist_conn.executemany("""
+        INSERT INTO search_idx (session_id, root_session_id, directory, role, text, time_created)
+        VALUES (?,?,?,?,?,?)
+    """, [(session_id, root, "", role, text[:5000], tc) for role, text, tc in texts])
 
-    for row in oc_conn.execute("""
-        SELECT p.time_created, p.data, m.data as msg_data
-        FROM part p JOIN message m ON p.message_id = m.id
-        WHERE p.session_id = ? AND json_extract(p.data, '$.type') = 'text'
-        ORDER BY p.time_created
-    """, (session_id,)).fetchall():
-        try:
-            pd = json.loads(row["data"])
-            md = json.loads(row["msg_data"])
-        except (json.JSONDecodeError, TypeError):
-            continue
+    hist_conn.executemany("""
+        INSERT OR IGNORE INTO session_files (session_id, root_session_id, file_path, how, time_created)
+        VALUES (?,?,?,?,?)
+    """, [(session_id, root, path, how, tc) for (path, how), tc in files.items()])
 
-        text = pd.get("text", "")
-        role = md.get("role", "unknown")
-        if not text or not text.strip():
-            continue
-
-        fts_text = text[:5000] if len(text) > 5000 else text
-        hist_conn.execute("""
-            INSERT INTO search_idx (session_id, root_session_id, directory, role, text, time_created)
-            VALUES (?,?,?,?,?,?)
-        """, (session_id, root, "", role, fts_text, row["time_created"]))
-        parts_counted += 1
-
-        if role == "user":
-            if first_prompt is None or row["time_created"] < first_prompt[0]:
-                first_prompt = (row["time_created"], text[:500])
-        if role == "assistant":
-            if last_assistant is None or row["time_created"] > last_assistant[0]:
-                last_assistant = (row["time_created"], text[:500])
-
-    if first_prompt:
-        hist_conn.execute(
-            "UPDATE sessions SET first_user_prompt = ? WHERE session_id = ?",
-            (first_prompt[1], session_id)
-        )
-    if last_assistant:
-        hist_conn.execute(
-            "UPDATE sessions SET last_assistant_text = ? WHERE session_id = ?",
-            (last_assistant[1], session_id)
-        )
-
-    files_counted = 0
-    for row in oc_conn.execute("""
-        SELECT time_created, data FROM part
-        WHERE session_id = ? AND json_extract(data, '$.type') = 'patch'
-          AND json_extract(data, '$.files') IS NOT NULL
-    """, (session_id,)).fetchall():
-        try:
-            data = json.loads(row["data"])
-            files = data.get("files", [])
-            if not isinstance(files, list):
-                continue
-            for f in files:
-                if isinstance(f, str) and f.strip():
-                    hist_conn.execute("""
-                        INSERT OR IGNORE INTO session_files
-                        (session_id, root_session_id, file_path, how, time_created)
-                        VALUES (?,?,?,?,?)
-                    """, (session_id, root, f.strip(), "modified", row["time_created"]))
-                    files_counted += 1
-        except (json.JSONDecodeError, TypeError):
-            continue
-
-    return 1, parts_counted, files_counted
+    return 1, len(texts), len(files)
 
 
 def _remove_sessions_from_index(hist_conn, session_ids):
-    """Remove sessions and their index data. If session_ids is None, removes ALL."""
-    if session_ids is None:
-        hist_conn.execute("DELETE FROM sessions")
-        hist_conn.execute("DELETE FROM search_idx")
-        hist_conn.execute("DELETE FROM session_files")
-        return
-
+    """Remove sessions and their index data."""
     if not session_ids:
         return
-
     placeholders = ",".join("?" * len(session_ids))
     hist_conn.execute(f"DELETE FROM sessions WHERE session_id IN ({placeholders})", session_ids)
     hist_conn.execute(f"DELETE FROM search_idx WHERE session_id IN ({placeholders})", session_ids)
@@ -634,41 +465,23 @@ def _remove_sessions_from_index(hist_conn, session_ids):
 
 
 def _detect_deleted_sessions(oc_conn, hist_conn):
-    """Find sessions present in the index but no longer in OpenCode's DB.
+    """Remove sessions present in the index but gone from OpenCode's DB.
 
     Returns the count removed.
     """
-    indexed = hist_conn.execute("SELECT session_id FROM sessions").fetchall()
-    indexed_ids = [r["session_id"] for r in indexed]
-
-    if not indexed_ids:
-        return 0
-
-    deleted = []
-    batch_size = 500
-    for i in range(0, len(indexed_ids), batch_size):
-        batch = indexed_ids[i:i + batch_size]
-        placeholders = ",".join("?" * len(batch))
-        existing = oc_conn.execute(
-            f"SELECT id FROM session WHERE id IN ({placeholders})", batch
-        ).fetchall()
-        existing_ids = set(r["id"] for r in existing)
-        deleted.extend([sid for sid in batch if sid not in existing_ids])
-
-    if deleted:
-        _remove_sessions_from_index(hist_conn, deleted)
-
+    existing = {r[0] for r in oc_conn.execute("SELECT id FROM session_v2")}
+    deleted = [r[0] for r in hist_conn.execute("SELECT session_id FROM sessions") if r[0] not in existing]
+    _remove_sessions_from_index(hist_conn, deleted)
     return len(deleted)
 
 
-def _update_watermark(hist_conn, part_max, session_max):
+def _update_watermark(hist_conn, watermark):
     """Persist the sync watermark used to detect stale/fresh state."""
     hist_conn.execute("""
         INSERT OR REPLACE INTO index_meta (key, value) VALUES
-        ('last_sync_part_time', ?),
-        ('last_sync_session_time', ?),
+        ('source_watermark', ?),
         ('last_sync', ?)
-    """, (str(part_max), str(session_max), str(int(time.time() * 1000))))
+    """, (str(watermark), str(int(time.time() * 1000))))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -689,14 +502,17 @@ def main() -> None:
 
     oc_conn = connect_opencode_db()
     hist_conn = connect_history_db()
-
-    if mode == "--sync":
-        incremental_sync(oc_conn, hist_conn)
-    else:
-        full_build(oc_conn, hist_conn)
-
-    oc_conn.close()
-    hist_conn.close()
+    try:
+        if mode == "--sync":
+            incremental_sync(oc_conn, hist_conn)
+        else:
+            full_build(oc_conn, hist_conn)
+    except UnsupportedSchemaError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        oc_conn.close()
+        hist_conn.close()
 
 
 if __name__ == "__main__":
